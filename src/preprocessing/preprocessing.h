@@ -1,12 +1,37 @@
-#ifndef IMAGE_PROCESSING_H
-#define IMAGE_PROCESSING_H
+#ifndef PREPROCESSING_H
+#define PREPROCESSING_H
 
 #include <opencv2/opencv.hpp>
+#include <vector>
+#include <thread>
 
-// Déclaration des fonctions
-void grayscale_filter(cv::Mat* input_image, unsigned char* gray_vec);
-void gradient_filter(unsigned char* gray_vec, unsigned char* gradient_vec, int rows, int cols);
-void binarize(unsigned char* gradient_vec, unsigned char* bin_vec, int rows, int cols);
-void hough_filter(unsigned char* bin_vec, cv::Mat* output_image, int rows, int cols);
+// Structure pour les résultats du détecteur de lignes
+struct LineDetectionResult {
+    std::vector<cv::Vec2f> lines; // Lignes détectées en format rho, theta
+    std::vector<cv::Vec4i> lineSegments; // Segments de ligne en format x1, y1, x2, y2
+    double processingTime;  // Temps de traitement en ms
+};
 
-#endif // IMAGE_PROCESSING_H
+// Méthodes de grayscale
+void grayscaleFilter(const cv::Mat& inputImage, cv::Mat& outputImage, bool useMultithread = false);
+void grayscaleFilterThreaded(const cv::Mat& inputImage, cv::Mat& outputImage, int numThreads);
+
+// Méthodes de détection de contours
+void sobelFilter(const cv::Mat& inputImage, cv::Mat& outputImage, bool useMultithread = false);
+void sobelFilterThreaded(const cv::Mat& inputImage, cv::Mat& outputImage, int numThreads);
+void cannyFilter(const cv::Mat& inputImage, cv::Mat& outputImage, double threshold1 = 50, double threshold2 = 150, bool useMultithread = false);
+
+// Méthodes de binarisation
+void binarize(const cv::Mat& inputImage, cv::Mat& outputImage, int threshold = 128);
+void adaptiveBinarize(const cv::Mat& inputImage, cv::Mat& outputImage, int blockSize = 11, int C = 2);
+
+// Transformées de Hough
+LineDetectionResult houghTransform(const cv::Mat& inputImage, cv::Mat& outputImage, int threshold = 100, bool useBinarization = true, bool useMultithread = false);
+LineDetectionResult houghTransformNoBinarization(const cv::Mat& inputImage, cv::Mat& outputImage, int threshold = 50, bool useMultithread = false);
+LineDetectionResult probabilisticHoughTransform(const cv::Mat& inputImage, cv::Mat& outputImage, int threshold = 50, bool useMultithread = false);
+
+// Méthodes utilitaires
+void drawLines(cv::Mat& image, const std::vector<cv::Vec2f>& lines, const cv::Scalar& color = cv::Scalar(0, 0, 255));
+void drawLineSegments(cv::Mat& image, const std::vector<cv::Vec4i>& lineSegments, const cv::Scalar& color = cv::Scalar(0, 0, 255));
+
+#endif // PREPROCESSING_H
