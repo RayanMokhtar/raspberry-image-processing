@@ -1,289 +1,241 @@
+#include <stdio.h>
 #include <iostream>
-#include <string>
-#include <chrono>
-#include <thread>
-#include <opencv2/opencv.hpp>
+#include "opencv4/opencv2/opencv.hpp"
+using namespace cv;
 
-#include "acquisition/acquisition.h"
-#include "preprocessing/preprocessing.h"
-#include "core/metrics.h"
-#include "core/thread_pool.h"
+#include <sys/time.h>
+#define PI 3.14159265
+#define thetaStep 4
 
-// Paramètres du programme
-struct ProgramSettings {
-    std::string inputSource;
-    bool useCamera;
-    bool useBinarization;
-    bool useMultithreading;
-    int numThreads;
-    int houghThreshold;
-    bool useHoughProbabilistic;
-    bool showDebugWindows;
-    bool testPerformance;
-    int stressLevel; // Niveau de stress pour les tests (0 = aucun)
-    int runTime;     // Durée d'exécution en secondes (0 = infinie)
-};
+#define VIDEO 1
 
-// Configuration par défaut
-ProgramSettings defaultSettings() {
-    return {
-        "../../data/route_low.jpg", // Source d'entrée
-        false,                      // Utiliser la caméra
-        true,                       // Utiliser la binarisation
-        true,                       // Utiliser le multithreading
-        std::thread::hardware_concurrency(), // Nombre de threads
-        100,                        // Seuil Hough
-        false,                      // Utiliser Hough probabiliste
-        true,                       // Afficher fenêtres de débogage
-        false,                      // Mode test de performance
-        0,                          // Niveau de stress
-        0                           // Durée d'exécution (0 = infinie)
-    };
+void Sobel1(Mat frame, int * filterGX,int * filterGY, int size, Mat * out, int limit){
+
+  //Convolution Time ! (adding threshold to result might improve performances significantly)
+  int step = std::floor(size/2);
+  float sumX,sumY;
+  for(int y=1;y<frame.cols-1;y++){
+    for(int x=1;x<frame.rows-1;x++){
+      sumX=0;
+      sumY=0;
+      /*
+      sumX = -frame.at<uchar>(Point(y-1,x-1))
+              -2*frame.at<uchar>(Point(y,x-1))
+              -frame.at<uchar>(Point(y+1,x-1))+
+              frame.at<uchar>(Point(y-1,x+1))+
+              2*frame.at<uchar>(Point(y,x+1))+
+              frame.at<uchar>(Point(y+1,x+1));
+      sumY = -frame.at<uchar>(Point(y-1,x-1))
+              -2*frame.at<uchar>(Point(y-1,x))
+              -frame.at<uchar>(Point(y-1,x+1))+
+              frame.at<uchar>(Point(y+1,x-1))+
+              2*frame.at<uchar>(Point(y+1,x))+
+              frame.at<uchar>(Point(y+1,x+1));
+      */
+      for(int i=0;i<size;i++){
+        for(int j=0;j<size;j++){
+          sumX+=filterGX[i*size+j]*frame.at<uchar>(Point(y-step+i,x-step+j));
+          sumY+=filterGY[i*size+j]*frame.at<uchar>(Point(y-step+i,x-step+j));
+        }
+      }
+      out->at<uchar>(Point(y,x)) = sqrt(pow(sumX,2)+pow(sumY,2))/4;
+
+      if(sqrt(pow(sumX,2)+pow(sumY,2))/4<limit)
+        out->at<uchar>(Point(y,x)) = 0;
+      //else
+        //out->at<uchar>(Point(y,x)) = 0;
+
+    }
+  }
 }
 
-// Parses command line arguments and updates settings
-void parseArgs(int argc, char** argv, ProgramSettings& settings) {
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        
-        if (arg == "--camera" || arg == "-c") {
-            settings.useCamera = true;
-            if (i + 1 < argc && argv[i+1][0] != '-') {
-                settings.inputSource = argv[++i];
-            } else {
-                settings.inputSource = "0"; // Default camera
-            }
-        }
-        else if (arg == "--image" || arg == "-i") {
-            settings.useCamera = false;
-            if (i + 1 < argc) {
-                settings.inputSource = argv[++i];
-            }
-        }
-        else if (arg == "--no-binarization") {
-            settings.useBinarization = false;
-        }
-        else if (arg == "--no-multithread") {
-            settings.useMultithreading = false;
-        }
-        else if (arg == "--threads") {
-            if (i + 1 < argc) {
-                settings.numThreads = std::stoi(argv[++i]);
-            }
-        }
-        else if (arg == "--threshold") {
-            if (i + 1 < argc) {
-                settings.houghThreshold = std::stoi(argv[++i]);
-            }
-        }
-        else if (arg == "--probabilistic") {
-            settings.useHoughProbabilistic = true;
-        }
-        else if (arg == "--no-debug") {
-            settings.showDebugWindows = false;
-        }
-        else if (arg == "--test") {
-            settings.testPerformance = true;
-        }
-        else if (arg == "--stress") {
-            if (i + 1 < argc) {
-                settings.stressLevel = std::stoi(argv[++i]);
-            } else {
-                settings.stressLevel = 5; // Default stress level
-            }
-        }
-        else if (arg == "--time") {
-            if (i + 1 < argc) {
-                settings.runTime = std::stoi(argv[++i]);
-            }
-        }
-        else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: " << argv[0] << " [options]\n"
-                      << "Options:\n"
-                      << "  -c, --camera [id]     Use camera (default: 0)\n"
-                      << "  -i, --image <path>    Use image file\n"
-                      << "  --no-binarization     Disable binarization\n"
-                      << "  --no-multithread      Disable multithreading\n"
-                      << "  --threads <n>         Set number of threads\n"
-                      << "  --threshold <n>       Set Hough threshold\n"
-                      << "  --probabilistic       Use probabilistic Hough\n"
-                      << "  --no-debug            Hide debug windows\n"
-                      << "  --test                Run performance tests\n"
-                      << "  --stress <level>      Add CPU stress (0-10)\n"
-                      << "  --time <seconds>      Run duration in seconds\n"
-                      << "  -h, --help            Show this help\n";
-            exit(0);
-        }
+void SobelED(Mat frame, Mat * out,int limit){
+
+  if(limit>255 || limit<0)
+    limit=255;
+  float sumX,sumY;
+  for(int y=1;y<frame.cols-1;y++){
+    for(int x=1;x<frame.rows-1;x++){
+      sumX=0;
+      sumY=0;
+      sumX = frame.at<uchar>(Point(y,x+1))-frame.at<uchar>(Point(y,x-1));
+      sumY = frame.at<uchar>(Point(y+1,x))-frame.at<uchar>(Point(y-1,x));
+
+      if(sqrt(pow(sumX,2)+pow(sumY,2))>limit){
+        out->at<uchar>(Point(y,x)) = 255;
+      }
+
+      else{
+        out->at<uchar>(Point(y,x)) = 0;
+      }
     }
+  }
 }
 
-// Fonction pour simuler une charge CPU (pour les tests de stress)
-void stressCPU(int level) {
-    if (level <= 0) return;
-    
-    // Créer des threads pour stresser le CPU
-    int numThreads = level;
-    std::vector<std::thread> stressThreads;
-    
-    for (int i = 0; i < numThreads; i++) {
-        stressThreads.emplace_back([i]() {
-            auto start = std::chrono::high_resolution_clock::now();
-            while (std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::high_resolution_clock::now() - start).count() < 600) {
-                // Calculer des racines carrées pour stresser le CPU
-                for (volatile int j = 0; j < 100000; j++) {
-                    volatile double x = std::sqrt(j * 123.456);
-                    (void)x;
-                }
-            }
-        });
-    }
-    
-    // Détacher les threads pour qu'ils s'exécutent en arrière-plan
-    for (auto& t : stressThreads) {
-        t.detach();
-    }
+int diff_ms(timeval t1, timeval t2)
+{
+    return (((t1.tv_sec - t2.tv_sec) * 1000000) +
+            (t1.tv_usec - t2.tv_usec))/1000;
 }
 
-int main(int argc, char** argv) {
-    // Configuration du programme
-    ProgramSettings settings = defaultSettings();
-    parseArgs(argc, argv, settings);
-    
-    // Initialisation des métriques
-    PerformanceMetrics metrics;
-    
-    // Initialisation de l'acquisition
-    ImageAcquisition acquisition;
-    if (!acquisition.init(
-        settings.useCamera ? ImageAcquisition::SourceType::CAMERA : ImageAcquisition::SourceType::IMAGE_FILE,
-        settings.inputSource)) {
-        std::cerr << "Failed to initialize acquisition from source: " << settings.inputSource << std::endl;
-        return 1;
+// Convert RGB image to grayscale using the luminosity method
+void RGBtoGrayScale(Mat rgb, Mat* grayscale){
+  std::vector<Mat> channels(3);
+  split(rgb, channels);
+  *grayscale = (0.07*channels[0] + 0.72*channels[1] + 0.21*channels[2]);
+}
+
+void simpleHough(Mat frame, Mat* acc, Mat *f){
+  int channels = frame.channels();
+  int nRows = frame.rows;
+  int nCols = frame.cols * channels;
+  //const uchar* image = frame.ptr();
+  int step = (int)frame.step;
+  int stepacc = (int)acc->step;
+  if (frame.isContinuous())
+  {
+      nCols *= nRows;
+      nRows = 1;
+  }
+
+  int i,j;
+  double rho;
+  for( i = 0; i < frame.rows; i++ ){
+    for( j = 0; j < frame.cols; j++ ){
+      if(frame.data[i * step + j]!=0){
+        for(int theta=0;theta<180; theta+=thetaStep){
+          rho = j*cos((double)theta*PI/180)+i*sin((double)theta*PI/180);
+          if(rho!=0)
+            acc->at<ushort>(Point(cvRound(rho) ,(int)cvRound(theta/thetaStep)))+=1;
+        }
+      }
     }
-    
-    // Appliquer la charge de stress si demandée
-    if (settings.stressLevel > 0) {
-        std::cout << "Applying CPU stress level " << settings.stressLevel << std::endl;
-        stressCPU(settings.stressLevel);
+  }
+  cv::Point min_loc, max_loc;
+  cv::Point min_loc_old, max_loc_old;
+  double min, max;
+  cv::minMaxLoc(*acc, &min, &max, &min_loc_old, &max_loc_old);
+
+  Point pt1, pt2;
+  double a ,b;
+  double x0, y0;
+  double theta;
+  acc->data[max_loc_old.y * stepacc +max_loc_old.x]=0;
+  for(int i=0;i<40;i++){
+    cv::minMaxLoc(*acc, &min, &max, &min_loc, &max_loc);
+    if(abs(max_loc_old.x-max_loc.x)>5 || abs(max_loc_old.y-max_loc.y)>5){ //might be interesting to use that ....
+      theta = (double)max_loc.y*thetaStep;
+      a = cos(theta*PI/180); //compute hough inverse transform from polar to cartesian
+      b = sin(theta*PI/180);
+      x0 = a*max_loc.x;
+      y0 = b*max_loc.x;
+      pt1.x = cvRound(x0 + 1000*(-b)); //compute first point belonging to the line
+      pt1.y = cvRound(y0 + 1000*(a));
+      pt2.x = cvRound(x0 - 1000*(-b)); //compute second point
+      pt2.y = cvRound(y0 - 1000*(a));
+      line( *f, pt1, pt2, Scalar(0,0,255), 3, LINE_AA);
+      acc->at<ushort>(Point(max_loc.x ,max_loc.y))=0;
+      max_loc_old.x = max_loc.x;
+      max_loc_old.y = max_loc.y;
     }
-    
-    cv::Mat frame, grayscale, edges, result;
-    bool running = true;
-    int frameCount = 0;
-    
-    auto startTime = std::chrono::high_resolution_clock::now();
-    
-    while (running) {
-        // Mesurer le temps total
-        metrics.startMeasurement(MetricType::TOTAL_PROCESSING);
-        
-        // Acquisition d'image
-        {
-            ScopedTimer timer(metrics, MetricType::ACQUISITION);
-            if (!acquisition.getFrame(frame)) {
-                std::cerr << "Failed to acquire frame" << std::endl;
-                break;
-            }
-        }
-        
-        // Prétraitement (grayscale)
-        {
-            ScopedTimer timer(metrics, MetricType::GRAYSCALE);
-            grayscaleFilter(frame, grayscale, settings.useMultithreading);
-        }
-        
-        // Détection de contours
-        {
-            ScopedTimer timer(metrics, MetricType::EDGE_DETECTION);
-            sobelFilter(grayscale, edges, settings.useMultithreading);
-        }
-        
-        // Binarisation (si activée)
-        if (settings.useBinarization) {
-            ScopedTimer timer(metrics, MetricType::BINARIZATION);
-            binarize(edges, edges, 100);
-        }
-        
-        // Transformée de Hough
-        LineDetectionResult houghResult;
-        {
-            ScopedTimer timer(metrics, MetricType::HOUGH_TRANSFORM);
-            if (settings.useHoughProbabilistic) {
-                houghResult = probabilisticHoughTransform(edges, frame, settings.houghThreshold, settings.useMultithreading);
-            } else {
-                houghResult = houghTransform(edges, frame, settings.houghThreshold, settings.useBinarization, settings.useMultithreading);
-            }
-        }
-        
-        // Affichage
-        {
-            ScopedTimer timer(metrics, MetricType::DISPLAY);
-            if (settings.showDebugWindows) {
-                cv::imshow("Original", frame);
-                cv::imshow("Grayscale", grayscale);
-                cv::imshow("Edges", edges);
-            }
-            
-            // Afficher les FPS sur l'image
-            double fps = metrics.calculateFPS();
-            std::string fpsText = "FPS: " + std::to_string(fps);
-            cv::putText(frame, fpsText, cv::Point(30, 30), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 255, 0), 2);
-            
-            std::string timeText = "Time: " + std::to_string(metrics.getLastMeasurement(MetricType::TOTAL_PROCESSING)) + " ms";
-            cv::putText(frame, timeText, cv::Point(30, 60), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 255, 0), 2);
-            
-            cv::imshow("Result", frame);
-            
-            int key = cv::waitKey(1);
-            if (key == 27) { // Échap pour quitter
-                running = false;
-            }
-        }
-        
-        // Finaliser la mesure du temps total
-        metrics.endMeasurement(MetricType::TOTAL_PROCESSING);
-        
-        // Incrémenter le compteur de frames
-        frameCount++;
-        
-        // Vérifier si la durée d'exécution est écoulée (si spécifiée)
-        if (settings.runTime > 0) {
-            auto now = std::chrono::high_resolution_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - startTime).count();
-            if (duration >= settings.runTime) {
-                running = false;
-            }
-        }
-        
-        // Si on traite une seule image (pas en mode caméra), sortir après une frame
-        if (!settings.useCamera && !settings.testPerformance) {
-            running = false;
-        }
+    else{
+      acc->at<ushort>(Point(max_loc.x ,max_loc.y))=0;
+      i--;
     }
-    
-    // Afficher les résultats de performance
-    auto endTime = std::chrono::high_resolution_clock::now();
-    double totalRunTime = std::chrono::duration<double>(endTime - startTime).count();
-    
-    std::cout << "\n=== Performance Summary ===" << std::endl;
-    std::cout << "Total frames: " << frameCount << std::endl;
-    std::cout << "Total run time: " << totalRunTime << " s" << std::endl;
-    std::cout << "Average FPS: " << frameCount / totalRunTime << std::endl;
-    
-    metrics.printReport();
-    
-    // Sauvegarder les métriques dans un fichier
-    std::string metricsFile = "performance_metrics_" + 
-                             std::to_string(settings.useBinarization) + "_" +
-                             std::to_string(settings.useMultithreading) + "_" +
-                             std::to_string(settings.stressLevel) + ".csv";
-    metrics.saveToFile(metricsFile);
-    std::cout << "Metrics saved to " << metricsFile << std::endl;
-    
-    // Libérer les ressources
-    acquisition.release();
-    cv::destroyAllWindows();
-    
+  }
+}
+
+
+
+int main(int argc, char** argv)
+{
+  timeval start, end;
+  printf("OK !\n");
+  char name[50];
+  Mat frame;
+  Mat canny;
+
+  #if VIDEO
+  VideoCapture cap(0); // open the default camera
+  if(!cap.isOpened()){  // check if we succeeded
+      printf("Error capture\n");
+      return -1;
+  }
+  cap >> frame;
+  #endif
+  #if VIDEO==0
+  //Mat frame;
+  frame = imread(argv[1], IMREAD_COLOR);
+
+  if(! frame.data )                              // Check for invalid input
+  {
+        std::cout <<  "Could not open or find the image" << std::endl ;
+        return -1;
+    }
+    #endif
+
+
+  printf("setup\n");
+    int x = frame.rows;
+    int y = frame.cols;
+    Size pt = Size(sqrt(pow(x,2)+pow(y,2))*2,ceil(180/thetaStep));
+    printf("rows : %d, cols : %d \n",frame.rows, frame.cols);
+    Mat acc = Mat::zeros(pt, CV_16UC1);
+    /* example of creating image and save it using opencv
+    Mat exmp = Mat::zeros(Size(200,200),CV_16UC1);
+    exmp.at<uchar>(Point(20,5))=255;
+    exmp.at<uchar>(Point(100,25))=255;
+
+    exmp.at<uchar>(Point(20,5))=255;
+    exmp.at<uchar>(Point(100,25))=255;
+    imwrite( "./test5.jpg", exmp );
+    */
+    printf("rho : %d, theta : %d \n",acc.cols, acc.rows); //size of the accumulation matrix
+    Mat grayscale = Mat::zeros(Size(frame.rows,frame.cols),CV_8UC1);
+    Mat sobel = Mat::zeros(Size(frame.cols,frame.rows),CV_8UC1);
+    int filterGX[9] = {-1,0,1,-2,0,2,-1,0,1};
+    int filterGY[9] = {-1,-2,-1,0,0,0,1,2,1};
+    int convSize = 3;
+    namedWindow("Color Frame",1);
+    namedWindow("Sobel Frame",1);
+
+    #if VIDEO==0 //if image mode selected, must have image path as first argument
+    RGBtoGrayScale(frame,&grayscale);
+    GaussianBlur(grayscale, grayscale, Size(9,9), 2, 2);
+    Sobel1(grayscale,filterGX,filterGY,convSize, &sobel,25);
+    //Canny( grayscale, sobel, 60, 60*3,3);
+    //SobelED(grayscale,&sobel,20);
+    simpleHough(sobel,&acc,&frame);
+
+    imshow( "Color Frame", frame );  // Show our image with hough line detection
+    imshow( "Sobel Frame", sobel );
+    imshow("Acc Frame", acc);
+    waitKey(0); //wait for key pressed in order to propely close all opencv windows
+    #else //if video selected, no needs of arguments in the program call
+    for(;;)
+    {
+        Mat res;
+        gettimeofday(&start,NULL);
+        cap >> frame; // get a new frame from camera
+        acc = Mat::zeros(pt, CV_16UC1); //16 bits for accumulatio matrix
+        RGBtoGrayScale(frame,&grayscale);
+        GaussianBlur(grayscale, grayscale, Size(9,9), 1.5, 1.5);
+        //Sobel1(grayscale,filterGX,filterGY,3, &sobel); //sobel filter, not optimized though
+        SobelED(grayscale,&sobel,20); //simple filter use for testing only, not mean to be used with hough transform
+        //Canny( grayscale, sobel, 60, 60*3,3); //opencv canny filter, use to compare performances
+        simpleHough(sobel,&acc,&frame);
+        gettimeofday(&end,NULL);
+        int ms = diff_ms(end,start);
+        //normalize(acc,acc,0,255,NORM_MINMAX, CV_16UC1); //normalize mat, use at your discretion
+        sprintf (name, "fps : %f", 1/((double)ms/1000));
+        putText(frame, name, cv::Point(30,30), FONT_HERSHEY_COMPLEX_SMALL, 0.8, cv::Scalar(20,20,25), 1, LINE_AA);
+
+        imshow( "Color Frame", frame );  // Show image with Hough line detection
+        imshow( "Sobel Frame", sobel );  // show filter image
+        imshow("Acc Frame", acc);
+        if(waitKey(33) == 27) break;
+    }
+    #endif
+    // the camera will be deinitialized automatically in VideoCapture destructor
     return 0;
 }
