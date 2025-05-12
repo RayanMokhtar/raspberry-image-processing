@@ -14,7 +14,7 @@ using namespace chrono;
 // Constantes
 const int NUM_THREADS = 4; // demain tester avec 3 4 5 threads
 const double ROI_FACTOR = 0.5; 
-const int THETA_STEP = 3 ;
+const int THETA_STEP = 2;
 const double PI = 3.14159265;
 
 // Structure pour les métriques
@@ -22,6 +22,8 @@ struct Metrics {
     double sobelTime;
     double houghTime;
     double totalTime;
+    double gaussianTime ; 
+    double readImageTime;
     int numLinesDetected;
     double averageLineLength;
     double processingFPS;
@@ -38,6 +40,70 @@ struct ThreadParams {
     int endRow;
     int threshold;
 };
+
+private:
+    // Variables pour le calcul du CPU idle
+    FILETIME prevIdleTime;
+    FILETIME prevKernelTime;
+    FILETIME prevUserTime;
+    bool isFirstMeasure;
+
+    // Fonction pour mesurer le pourcentage de CPU idle
+    double getCPUIdlePercentage() {
+        FILETIME idleTime, kernelTime, userTime;
+        
+        // Obtenir les temps système actuels
+        if (!GetSystemTimes(&idleTime, &kernelTime, &userTime)) {
+            return -1.0;
+        }
+        
+        // Si c'est la première mesure, initialiser les valeurs et retourner 0
+        if (isFirstMeasure) {
+            prevIdleTime = idleTime;
+            prevKernelTime = kernelTime;
+            prevUserTime = userTime;
+            isFirstMeasure = false;
+            return 0.0;
+        }
+        
+        // Convertir les FILETIME en ULARGE_INTEGER pour les calculs
+        ULARGE_INTEGER idle, kernel, user, prevIdle, prevKernel, prevUser;
+        
+        idle.LowPart = idleTime.dwLowDateTime;
+        idle.HighPart = idleTime.dwHighDateTime;
+        
+        kernel.LowPart = kernelTime.dwLowDateTime;
+        kernel.HighPart = kernelTime.dwHighDateTime;
+        
+        user.LowPart = userTime.dwLowDateTime;
+        user.HighPart = userTime.dwHighDateTime;
+        
+        prevIdle.LowPart = prevIdleTime.dwLowDateTime;
+        prevIdle.HighPart = prevIdleTime.dwHighDateTime;
+        
+        prevKernel.LowPart = prevKernelTime.dwLowDateTime;
+        prevKernel.HighPart = prevKernelTime.dwHighDateTime;
+        
+        prevUser.LowPart = prevUserTime.dwLowDateTime;
+        prevUser.HighPart = prevUserTime.dwHighDateTime;
+        
+        // Calculer les différences
+        ULONGLONG idleDiff = idle.QuadPart - prevIdle.QuadPart;
+        ULONGLONG totalDiff = (kernel.QuadPart - prevKernel.QuadPart) +
+                           (user.QuadPart - prevUser.QuadPart);
+        
+        // Stocker les valeurs actuelles pour la prochaine mesure
+        prevIdleTime = idleTime;
+        prevKernelTime = kernelTime;
+        prevUserTime = userTime;
+        
+        // Calculer le pourcentage de CPU idle
+        if (totalDiff > 0) {
+            return (idleDiff * 100.0) / totalDiff;
+        }
+        
+        return 0.0;
+    }
 
 // Fonction optimisée de Sobel
 void sobelThread(ThreadParams params) {
@@ -86,29 +152,40 @@ public:
     }
     
     void resetMetrics() {
+        metrics.readImageTime = 0 ; 
         metrics.sobelTime = 0;
         metrics.houghTime = 0;
         metrics.totalTime = 0;
+        metrics.gaussianTime = 0;
         metrics.numLinesDetected = 0;
         metrics.averageLineLength = 0;
         metrics.processingFPS = 0;
     }
     
     Mat processImage(const string& imagePath) {
+
+        double startIdle = getCPUIdlePercentage();
+    
         auto startTotal = high_resolution_clock::now();
         
         // Chargement de l'image
+        auto startImage = high_resolution_clock::now();
+
         Mat input = imread(imagePath);
         if(input.empty()) {
             throw runtime_error("Impossible de charger l'image: " + imagePath);
         }
-        
+        auto endImage = high_resolution_clock::now();
+        metrics.readImageTime = duration_cast<milliseconds>(endImage - startImage).count();
         // Conversion en niveaux de gris
         Mat gray;
         cvtColor(input, gray, COLOR_BGR2GRAY);
         
         // Flou gaussien pour réduire le bruit
+        auto startGaussienne = high_resolution_clock::now();
         GaussianBlur(gray, gray, Size(3, 3), 1.5);
+        auto endGaussienne = high_resolution_clock::now();
+        metrics.gaussianTime = duration_cast<milliseconds>(endGaussienne - startGaussienne).count();
         
         // Masque couleur jaune (en HSV) - plage élargie
         Mat hsv, mask_yellow;
@@ -161,6 +238,15 @@ public:
         metrics.totalTime = duration_cast<milliseconds>(endTotal - startTotal).count();
         metrics.processingFPS = 1000.0 / metrics.totalTime;
         
+        double endIdle = getCPUIdlePercentage();
+    
+        if (endIdle == 0) {
+        Sleep(100);  // Pause pour laisser passer un peu de temps
+        endIdle = getCPUIdlePercentage();
+        }
+        metrics.cpuIdle = endIdle;  // Stocker la mesure finale
+
+
         return result;
     }
     
@@ -229,12 +315,15 @@ public:
     
     void printMetrics() {
         cout << "\n=== Métriques de Performance ===" << endl;
+        cout << "Temps de lecture de l'image: " << metrics.readImageTime << " ms" << endl;
+        cout << "Temps de traitement Gaussienne : " << metrics.gaussianTime << " ms" << endl;
         cout << "Temps de traitement Sobel: " << fixed << setprecision(2) << metrics.sobelTime << " ms" << endl;
         cout << "Temps de traitement Hough: " << metrics.houghTime << " ms" << endl;
         cout << "Temps total de traitement: " << metrics.totalTime << " ms" << endl;
         cout << "FPS: " << metrics.processingFPS << endl;
         cout << "Nombre de lignes détectées: " << metrics.numLinesDetected << endl;
         cout << "Longueur moyenne des lignes: " << metrics.averageLineLength << " pixels" << endl;
+        cout << "CPU Idle: " << metrics.cpuIdle << " %" << endl;
         cout << "==============================\n" << endl;
     }
 };
