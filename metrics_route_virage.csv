@@ -1,0 +1,13 @@
+Operation,Duration_ms,CPU_Idle_Pct,Core0_Usage_Pct,Core1_Usage_Pct,Core2_Usage_Pct,Core3_Usage_Pct,Temperature_C,RAM_Usage_MB,RAM_Pct
+Initial,0,100,0,0,0,0,45,715.492,9.45876
+ReadImage,16,100,0,0,0,0,45,716.23,9.46852
+Grayscale,2,100,0,0,0,0,45,716.723,9.47503
+Gaussian,1,98.7654,0,0,0,0,45,717.461,9.48479
+HSVMask,8,100,0,0,0,0,45,718.938,9.50431
+Sobel,17,100,0,0,0,0,45,715.391,9.45742
+Hough,14,100,0,0,0,0,45,720.066,9.51923
+Final,983,100,0,0,0,0,45,720.066,9.51923
+
+Algorithmic Metrics
+NumLines,AvgLineLength,VerticalLines,CentralLines,IsRoadStraight,FPS
+40,230.167,40,40,true,1.01729

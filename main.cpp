@@ -41,69 +41,6 @@ struct ThreadParams {
     int threshold;
 };
 
-private:
-    // Variables pour le calcul du CPU idle
-    FILETIME prevIdleTime;
-    FILETIME prevKernelTime;
-    FILETIME prevUserTime;
-    bool isFirstMeasure;
-
-    // Fonction pour mesurer le pourcentage de CPU idle
-    double getCPUIdlePercentage() {
-        FILETIME idleTime, kernelTime, userTime;
-        
-        // Obtenir les temps système actuels
-        if (!GetSystemTimes(&idleTime, &kernelTime, &userTime)) {
-            return -1.0;
-        }
-        
-        // Si c'est la première mesure, initialiser les valeurs et retourner 0
-        if (isFirstMeasure) {
-            prevIdleTime = idleTime;
-            prevKernelTime = kernelTime;
-            prevUserTime = userTime;
-            isFirstMeasure = false;
-            return 0.0;
-        }
-        
-        // Convertir les FILETIME en ULARGE_INTEGER pour les calculs
-        ULARGE_INTEGER idle, kernel, user, prevIdle, prevKernel, prevUser;
-        
-        idle.LowPart = idleTime.dwLowDateTime;
-        idle.HighPart = idleTime.dwHighDateTime;
-        
-        kernel.LowPart = kernelTime.dwLowDateTime;
-        kernel.HighPart = kernelTime.dwHighDateTime;
-        
-        user.LowPart = userTime.dwLowDateTime;
-        user.HighPart = userTime.dwHighDateTime;
-        
-        prevIdle.LowPart = prevIdleTime.dwLowDateTime;
-        prevIdle.HighPart = prevIdleTime.dwHighDateTime;
-        
-        prevKernel.LowPart = prevKernelTime.dwLowDateTime;
-        prevKernel.HighPart = prevKernelTime.dwHighDateTime;
-        
-        prevUser.LowPart = prevUserTime.dwLowDateTime;
-        prevUser.HighPart = prevUserTime.dwHighDateTime;
-        
-        // Calculer les différences
-        ULONGLONG idleDiff = idle.QuadPart - prevIdle.QuadPart;
-        ULONGLONG totalDiff = (kernel.QuadPart - prevKernel.QuadPart) +
-                           (user.QuadPart - prevUser.QuadPart);
-        
-        // Stocker les valeurs actuelles pour la prochaine mesure
-        prevIdleTime = idleTime;
-        prevKernelTime = kernelTime;
-        prevUserTime = userTime;
-        
-        // Calculer le pourcentage de CPU idle
-        if (totalDiff > 0) {
-            return (idleDiff * 100.0) / totalDiff;
-        }
-        
-        return 0.0;
-    }
 
 // Fonction optimisée de Sobel
 void sobelThread(ThreadParams params) {
@@ -164,7 +101,6 @@ public:
     
     Mat processImage(const string& imagePath) {
 
-        double startIdle = getCPUIdlePercentage();
     
         auto startTotal = high_resolution_clock::now();
         
@@ -238,14 +174,6 @@ public:
         metrics.totalTime = duration_cast<milliseconds>(endTotal - startTotal).count();
         metrics.processingFPS = 1000.0 / metrics.totalTime;
         
-        double endIdle = getCPUIdlePercentage();
-    
-        if (endIdle == 0) {
-        Sleep(100);  // Pause pour laisser passer un peu de temps
-        endIdle = getCPUIdlePercentage();
-        }
-        metrics.cpuIdle = endIdle;  // Stocker la mesure finale
-
 
         return result;
     }
@@ -323,7 +251,6 @@ public:
         cout << "FPS: " << metrics.processingFPS << endl;
         cout << "Nombre de lignes détectées: " << metrics.numLinesDetected << endl;
         cout << "Longueur moyenne des lignes: " << metrics.averageLineLength << " pixels" << endl;
-        cout << "CPU Idle: " << metrics.cpuIdle << " %" << endl;
         cout << "==============================\n" << endl;
     }
 };
