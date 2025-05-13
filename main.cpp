@@ -6,6 +6,9 @@
 #include <mutex>
 #include <numeric>
 #include <iomanip>
+#include <filesystem>
+#include <string>
+#include <algorithm>
 
 using namespace cv;
 using namespace std;
@@ -13,9 +16,14 @@ using namespace chrono;
 
 // Constantes
 const int NUM_THREADS = 4; // demain tester avec 3 4 5 threads
-const double ROI_FACTOR = 0.5; 
-const int THETA_STEP = 2;
+const double ROI_FACTOR = 0.5; //  commence par 50% plus hauts
+const int THETA_STEP = 4;
 const double PI = 3.14159265;
+const std::string input_dir = "./data/"; // Changed from ..data/
+const std::string output_dir = "./output-data/"; 
+const int nombreMinimalLignes = 2 ;
+mutex acc_mutex;
+
 
 // Structure pour les métriques
 struct Metrics {
@@ -27,10 +35,10 @@ struct Metrics {
     int numLinesDetected;
     double averageLineLength;
     double processingFPS;
+    double modeSoupleTime;
+    double color ;
 };
 
-// Mutex pour l'accès concurrent
-mutex acc_mutex;
 
 // Structure pour les paramètres des threads
 struct ThreadParams {
@@ -41,50 +49,110 @@ struct ThreadParams {
     int threshold;
 };
 
+struct HoughThreadParams {
+    Mat* edges;
+    int startRow;
+    int endRow;
+    vector<Vec4i>* lines;
+    int threshold;
+    int minLineLength;
+    int maxLineGap;
+    mutex* linesMutex;
+};
 
-// Fonction optimisée de Sobel
-void sobelThread(ThreadParams params) {
-    for(int y = params.startRow; y < params.endRow; y++) {
-        for(int x = 1; x < params.input->cols - 1; x++) {
-            float gx = -params.input->at<uchar>(y-1, x-1) - 2*params.input->at<uchar>(y, x-1) - params.input->at<uchar>(y+1, x-1) +
-                      params.input->at<uchar>(y-1, x+1) + 2*params.input->at<uchar>(y, x+1) + params.input->at<uchar>(y+1, x+1);
-            
-            float gy = -params.input->at<uchar>(y-1, x-1) - 2*params.input->at<uchar>(y-1, x) - params.input->at<uchar>(y-1, x+1) +
-                      params.input->at<uchar>(y+1, x-1) + 2*params.input->at<uchar>(y+1, x) + params.input->at<uchar>(y+1, x+1);
-            
-            float magnitude = sqrt(gx*gx + gy*gy) / 4.0;
-            params.output->at<uchar>(y, x) = magnitude > params.threshold ? magnitude : 0;
-        }
-    }
+
+//fonctions utilitaires pour la lecture des images dans notre dataset 
+namespace fs = std::filesystem;
+
+bool isImageFile(const fs::path& path) {
+    if (!fs::is_regular_file(path)) return false;
+    
+    std::string ext = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    
+    // List of supported image extensions
+    const std::vector<std::string> validExtensions = {
+        ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"
+    };
+    
+    return std::find(validExtensions.begin(), validExtensions.end(), ext) != validExtensions.end();
 }
 
-// Fonction optimisée de Hough
-void houghThread(Mat& edges, Mat& accumulator, int startRow, int endRow) {
-    for(int y = startRow; y < endRow; y++) {
-        for(int x = 0; x < edges.cols; x++) {
-            if(edges.at<uchar>(y, x) > 0) {
-                for(int theta = 0; theta < 180; theta += THETA_STEP) {
-                    double rho = x * cos(theta * PI / 180.0) + y * sin(theta * PI / 180.0);
-                    int rhoIndex = cvRound(rho);
-                    
-                    if(rhoIndex >= 0 && rhoIndex < accumulator.rows) {
-                        lock_guard<mutex> lock(acc_mutex);
-                        accumulator.at<ushort>(rhoIndex, theta/THETA_STEP)++;
-                    }
-                }
+// Function to get all image files from a directory
+std::vector<fs::path> getImagesFromDirectory(const std::string& dirPath) {
+    std::vector<fs::path> imageFiles;
+    
+    try {
+        for (const auto& entry : fs::directory_iterator(dirPath)) {
+            if (isImageFile(entry.path())) {
+                imageFiles.push_back(entry.path());
             }
         }
+        
+        if (imageFiles.empty()) {
+            std::cout << "No image files found in directory: " << dirPath << std::endl;
+        }
+    } catch (const fs::filesystem_error& e) {
+        std::cerr << "Error accessing directory: " << e.what() << std::endl;
+    }
+    
+    return imageFiles;
+}
+
+bool ensureDirectoryExists(const std::string& dirPath) {
+    try {
+        if (!fs::exists(dirPath)) {
+            if (!fs::create_directories(dirPath)) {
+                std::cerr << "Failed to create directory: " << dirPath << std::endl;
+                return false;
+            }
+            std::cout << "Created output directory: " << dirPath << std::endl;
+        }
+        return true;
+    } catch (const fs::filesystem_error& e) {
+        std::cerr << "Error creating directory: " << e.what() << std::endl;
+        return false;
     }
 }
 
+
+
+
+//TODO à déplacer par la suite 
+void houghThreadFunction(HoughThreadParams params) {
+    // Créer une ROI pour la section d'image traitée par ce thread
+    Rect roi(0, params.startRow, params.edges->cols, params.endRow - params.startRow);
+    Mat edgesROI = (*params.edges)(roi);
+    
+    // Exécuter HoughLinesP sur cette région
+    vector<Vec4i> localLines;
+    HoughLinesP(edgesROI, localLines, 1, CV_PI*THETA_STEP/180, params.threshold, //TODO revenir sur cette logique de theta steps ? 
+                params.minLineLength, params.maxLineGap);
+    
+    // Ajuster les coordonnées des lignes pour correspondre à l'image globale
+    for(auto& line : localLines) {
+        line[1] += params.startRow;
+        line[3] += params.startRow;
+    }
+    
+    // Ajouter les lignes trouvées au vecteur global avec protection mutex
+    {
+        lock_guard<mutex> lock(*params.linesMutex);
+        for(const auto& line : localLines) {
+            params.lines->push_back(line);
+        }
+    }
+}
+
+
 // Classe principale pour le traitement d'image
-class RoadDetector {
+class DetecteurLignes {
 private:
     Metrics metrics;
     vector<thread> threads;
     
 public:
-    RoadDetector() {
+    DetecteurLignes() {
         resetMetrics();
     }
     
@@ -97,104 +165,88 @@ public:
         metrics.numLinesDetected = 0;
         metrics.averageLineLength = 0;
         metrics.processingFPS = 0;
+        metrics.modeSoupleTime = 0;
+        metrics.color = 0;
     }
     
-    Mat processImage(const string& imagePath) {
 
-    
-        auto startTotal = high_resolution_clock::now();
+
+    // Ajouter cette fonction à votre classe DetecteurLignes
+    cv::Mat augmenterConstraste(const Mat& input) {
+        Mat enhanced;
         
-        // Chargement de l'image
-        auto startImage = high_resolution_clock::now();
-
-        Mat input = imread(imagePath);
-        if(input.empty()) {
-            throw runtime_error("Impossible de charger l'image: " + imagePath);
+        // 1. Déterminer si l'image est sombre
+        Scalar meanIntensity = mean(input);
+        bool isDarkImage = (meanIntensity[0] + meanIntensity[1] + meanIntensity[2])/3 < 100;
+        
+        if(isDarkImage) {
+            // 2. Convertir en espace LAB pour travailler sur la luminosité
+            Mat labImg;
+            cvtColor(input, labImg, COLOR_BGR2Lab);
+            
+            // 3. Séparer les canaux
+            vector<Mat> labChannels(3);
+            split(labImg, labChannels);
+            
+            Ptr<CLAHE> clahe = createCLAHE();
+            clahe->setClipLimit(3.0);  // Limite de contraste
+            clahe->setTilesGridSize(Size(8, 8)); // Taille de la grille
+            clahe->apply(labChannels[0], labChannels[0]);
+            
+            // 5. Fusionner les canaux
+            merge(labChannels, labImg);
+            
+            // 6. Convertir de nouveau en BGR
+            cvtColor(labImg, enhanced, COLOR_Lab2BGR);
+        } else {
+            enhanced = input.clone();
         }
-        auto endImage = high_resolution_clock::now();
-        metrics.readImageTime = duration_cast<milliseconds>(endImage - startImage).count();
-        // Conversion en niveaux de gris
-        Mat gray;
-        cvtColor(input, gray, COLOR_BGR2GRAY);
         
-        // Flou gaussien pour réduire le bruit
-        auto startGaussienne = high_resolution_clock::now();
-        GaussianBlur(gray, gray, Size(3, 3), 1.5);
-        auto endGaussienne = high_resolution_clock::now();
-        metrics.gaussianTime = duration_cast<milliseconds>(endGaussienne - startGaussienne).count();
-        
-        // Masque couleur jaune (en HSV) - plage élargie
-        Mat hsv, mask_yellow;
-        cvtColor(input, hsv, COLOR_BGR2HSV);
-        // Plage élargie pour le jaune
-        Scalar lower_yellow(10, 60, 60), upper_yellow(45, 255, 255);
-        inRange(hsv, lower_yellow, upper_yellow, mask_yellow);
-        
-        // ROI dynamique : par défaut moitié inférieure, sinon 2/3 si route droite
-        int roi_mode = 0; // 0 = normal, 1 = spécial route droite
-        int roi_y = gray.rows * ROI_FACTOR;
-        int roi_height = gray.rows - roi_y;
-        // On commence avec la moitié inférieure
-        Rect roi_rect(0, roi_y, gray.cols, roi_height);
-        Mat roi_gray = gray(roi_rect);
-        Mat roi_mask = mask_yellow(roi_rect);
-        
-        // Application du filtre de Sobel sur la zone jaune uniquement
-        auto startSobel = high_resolution_clock::now();
-        Mat edges = applySobel(roi_gray, 30);
-        bitwise_and(edges, roi_mask, edges);
-        auto endSobel = high_resolution_clock::now();
-        metrics.sobelTime = duration_cast<milliseconds>(endSobel - startSobel).count();
-        
-        // Application de la transformée de Hough améliorée
-        auto startHough = high_resolution_clock::now();
-        Mat result = input.clone();
-        bool is_straight = false;
-        int numLines = applyHoughLinesP_adaptatif(edges, result, roi_y, roi_mode, is_straight);
-        // Si peu de lignes détectées, on relance avec des paramètres plus permissifs et une ROI plus grande
-        if(numLines < 2) {
-            // On prend les 2/3 inférieurs
-            roi_mode = 1;
-            roi_y = gray.rows / 3;
-            roi_height = gray.rows - roi_y;
-            roi_rect = Rect(0, roi_y, gray.cols, roi_height);
-            roi_gray = gray(roi_rect);
-            roi_mask = mask_yellow(roi_rect);
-            edges = applySobel(roi_gray, 20);
-            bitwise_and(edges, roi_mask, edges);
-            result = input.clone();
-            is_straight = false;
-            numLines = applyHoughLinesP_adaptatif(edges, result, roi_y, roi_mode, is_straight, true);
-        }
-        auto endHough = high_resolution_clock::now();
-        metrics.houghTime = duration_cast<milliseconds>(endHough - startHough).count();
-        
-        // Calcul des métriques finales
-        auto endTotal = high_resolution_clock::now();
-        metrics.totalTime = duration_cast<milliseconds>(endTotal - startTotal).count();
-        metrics.processingFPS = 1000.0 / metrics.totalTime;
-        
-
-        return result;
+        return enhanced;
     }
-    
-    // Nouvelle version de Sobel avec seuil paramétrable
-    Mat applySobel(Mat& input, int threshold = 50) {
+
+    Mat cannyMultiThread(cv::Mat& input, int seuil = 50) {
+        // Création de la matrice de sortie
         Mat output = Mat::zeros(input.size(), CV_8UC1);
-        int rowsPerThread = input.rows / NUM_THREADS;
         
-        threads.clear();
+        //nbr ligne par thread
+        int rowsPerThread = input.rows / NUM_THREADS;
+
+        //suffisamment de lignes pour chaque thread
+        rowsPerThread = max(rowsPerThread, 10);
+        
+        // Définir les seuils pour Canny
+        double threshold1 = seuil;
+        double threshold2 = seuil * 2.5;
+        int apertureSize = 3; // Taille standard pour Canny
+        
+        vector<thread> threads;
         for(int i = 0; i < NUM_THREADS; i++) {
-            ThreadParams params = {
-                &input,
-                &output,
-                i * rowsPerThread,
-                (i == NUM_THREADS-1) ? input.rows : (i+1) * rowsPerThread,
-                threshold
-            };
-            threads.emplace_back(sobelThread, params);
+            int startRow = i * rowsPerThread;
+            int endRow = (i == NUM_THREADS-1) ? input.rows : (i+1) * rowsPerThread;
+            
+            // Garantir un chevauchement pour éviter les artefacts aux frontières
+            int padding = 3; // Pour correspondre à apertureSize
+            startRow = max(0, startRow - (i > 0 ? padding : 0));
+            endRow = min(input.rows, endRow + (i < NUM_THREADS-1 ? padding : 0));
+            
+            //thread avec lambda , equivalent apply en python ou en js on aura par exemple les arrow functions ?? vérifier si c optimisé ? 
+
+            threads.emplace_back([&input, &output, startRow, endRow, threshold1, threshold2, apertureSize]() {
+                // Créer des ROI pour l'entrée et la sortie
+                Rect roi(0, startRow, input.cols, endRow - startRow);
+                Mat inputROI = input(roi);
+                Mat tempOutput;
+                
+                // Appliquer Canny sur cette région
+                Canny(inputROI, tempOutput, threshold1, threshold2, apertureSize);
+                
+                // Copier le résultat dans la matrice de sortie
+                tempOutput.copyTo(output(roi));
+            });
         }
         
+        // Attendre la fin de tous les threads
         for(auto& t : threads) {
             t.join();
         }
@@ -202,29 +254,172 @@ public:
         return output;
     }
     
-    // Nouvelle méthode HoughLinesP adaptative avec détection de route droite
-    int applyHoughLinesP_adaptatif(Mat& edges, Mat& result, int roi_y, int roi_mode, bool& is_straight, bool permissif=false) {
-        vector<Vec4i> linesP;
-        // Paramètres adaptatifs
-        int threshold = permissif ? 15 : 30;
-        int minLineLength = permissif ? 20 : 40;
-        int maxLineGap = permissif ? 40 : 20;
-        HoughLinesP(edges, linesP, 1, CV_PI/180, threshold, minLineLength, maxLineGap);
+    Mat sobelMultiThread(Mat& input, int threshold = 50) {
+        // Création de la matrice de sortie
+        Mat output = Mat::zeros(input.size(), CV_8UC1);
+        int rowsPerThread = input.rows / NUM_THREADS;
         
+        rowsPerThread = max(rowsPerThread, 5);
+        
+        vector<thread> threads;
+        for(int i = 0; i < NUM_THREADS; i++) {
+            int startRow = i * rowsPerThread;
+            int endRow = (i == NUM_THREADS-1) ? input.rows : (i+1) * rowsPerThread;
+            
+            // Garantir au moins 1 ligne de chevauchement aux frontières
+            startRow = max(0, startRow - (i > 0 ? 1 : 0)); 
+            endRow = min(input.rows, endRow + (i < NUM_THREADS-1 ? 1 : 0));
+            
+            threads.emplace_back([&input, &output, startRow, endRow, threshold]() {
+                // Création de régions d'intérêt pour ce thread
+                Mat inputROI = input(Range(startRow, endRow), Range(0, input.cols));
+                Mat outputROI = output(Range(startRow, endRow), Range(0, input.cols));
+                
+                // Création de matrices temporaires
+                Mat grad_x, grad_y;
+                Mat abs_grad_x, abs_grad_y;
+                Mat gradient;
+                
+                // Calcul des gradients dans les directions x et y
+                Sobel(inputROI, grad_x, CV_16S, 1, 0, 3, 1, 0, BORDER_DEFAULT);
+                Sobel(inputROI, grad_y, CV_16S, 0, 1, 3, 1, 0, BORDER_DEFAULT);
+                
+                // Conversion en valeurs absolues
+                convertScaleAbs(grad_x, abs_grad_x);
+                convertScaleAbs(grad_y, abs_grad_y);
+                
+                // Combinaison des gradients
+                addWeighted(abs_grad_x, 0.5, abs_grad_y, 0.5, 0, gradient);
+                
+                // Application du seuil
+                cv::threshold(gradient, outputROI, threshold, 255, THRESH_BINARY);
+            });
+        }
+        
+        // Attendre la fin de tous les threads
+        for(auto& t : threads) {
+            t.join();
+        }
+        
+        return output;
+    }
+    
+    
+
+    int houghMultiThreadAdaptative(Mat& edges, Mat& result, int roi_y, int roi_mode, bool& is_straight, bool is_souple=false) {
+        
+        //à ajuster TODO , mais j'ai l'impression que dépend bcp de qualité ilmage , 
+        int threshold = is_souple ? 15 : 30;
+        int minLineLength = is_souple ? 20 : 30;
+        int maxLineGap = is_souple ? 20 : 15; // à voir comment on traite les lignes discontinues comme ça , vu qu'on tolére distnace amax entre 2 pts de 20 pixels
+        
+
+        //logique de parallèlisation pour détection des ligens , à noter qu'on utilsie un mutex pour éviter les conflits d'accès
+        vector<Vec4i> allLines;
+        mutex linesMutex;
+        
+        int rowsPerThread = edges.rows / NUM_THREADS;
+        int overlap = minLineLength; // Chevauchement équivalent à la longueur minimale de ligne
+        
+        // Lancer les threads
+        vector<thread> threads;
+        for(int i = 0; i < NUM_THREADS; i++) {
+            int startRow = max(0, i * rowsPerThread - overlap);
+            int endRow = min(edges.rows, (i + 1) * rowsPerThread + overlap);
+            
+            // Éviter des régions trop petites pour le dernier thread
+            if(i == NUM_THREADS - 1) {
+                endRow = edges.rows;
+            }
+            
+            // Créer les paramètres du thread
+            HoughThreadParams params;
+            params.edges = &edges;
+            params.startRow = startRow;
+            params.endRow = endRow;
+            params.lines = &allLines;
+            params.threshold = threshold;
+            params.minLineLength = minLineLength;
+            params.maxLineGap = maxLineGap;
+            params.linesMutex = &linesMutex;
+            
+            // Lancer le thread
+            threads.emplace_back(houghThreadFunction, params); //emplacement de la fonction threaded
+        }
+        
+        // Attendre la fin de tous les threads
+        for(auto& t : threads) {
+            t.join();
+        }
+        
+        // Post-traitement : filtrer les lignes en double
+        vector<Vec4i> filteredLines;
+        if(!allLines.empty()) {
+            // Première étape : tri des lignes par position et angle
+            sort(allLines.begin(), allLines.end(), [](const Vec4i& a, const Vec4i& b) {
+                // Calculer les points milieux
+                Point2f midA((a[0] + a[2]) / 2.0f, (a[1] + a[3]) / 2.0f);
+                Point2f midB((b[0] + b[2]) / 2.0f, (b[1] + b[3]) / 2.0f);
+                
+                // Comparer d'abord par position y
+                if(abs(midA.y - midB.y) > 10)
+                    return midA.y < midB.y;
+                
+                // Puis par position x
+                if(abs(midA.x - midB.x) > 10)
+                    return midA.x < midB.x;
+                
+                // Enfin par angle
+                float angleA = atan2(a[3] - a[1], a[2] - a[0]);
+                float angleB = atan2(b[3] - b[1], b[2] - b[0]);
+                return angleA < angleB;
+            });
+            
+            // Deuxième étape : éliminer les doublons
+            filteredLines.push_back(allLines[0]);
+            for(size_t i = 1; i < allLines.size(); i++) {
+                const Vec4i& prev = filteredLines.back();
+                const Vec4i& curr = allLines[i];
+                
+                // Calculer les points milieux
+                Point2f midPrev((prev[0] + prev[2]) / 2.0f, (prev[1] + prev[3]) / 2.0f);
+                Point2f midCurr((curr[0] + curr[2]) / 2.0f, (curr[1] + curr[3]) / 2.0f);
+                
+                // Calculer les angles
+                float anglePrev = atan2(prev[3] - prev[1], prev[2] - prev[0]) * 180.0 / CV_PI;
+                float angleCurr = atan2(curr[3] - curr[1], curr[2] - curr[0]) * 180.0 / CV_PI;
+                
+                // Distance entre points milieux
+                float distance = norm(midPrev - midCurr);
+                
+                // Différence d'angle
+                float angleDiff = abs(anglePrev - angleCurr);
+                while(angleDiff > 180) angleDiff = 360 - angleDiff;
+                
+                // Si les lignes sont proches et ont un angle similaire, les considérer comme doublons
+                if(distance > 20 || angleDiff > 15) {
+                    filteredLines.push_back(curr);
+                }
+            }
+        }
+        
+        // Application des critères de sélection et dessin des lignes
         int numLines = 0;
         double totalLength = 0;
         int img_center = result.cols / 2;
         int nb_verticales = 0;
         int nb_centrales = 0;
-        for(const auto& l : linesP) {
+        
+        for(const auto& l : filteredLines) {
             double angle = atan2(l[3] - l[1], l[2] - l[0]) * 180.0 / CV_PI;
             double length = sqrt(pow(l[2] - l[0], 2) + pow(l[3] - l[1], 2));
             int x1 = l[0], x2 = l[2];
             int x_center = (x1 + x2) / 2;
             bool is_center = abs(x_center - img_center) < img_center * (roi_mode ? 0.6 : 0.45);
             bool is_vertical = (abs(angle) < 25 || abs(angle) > 155);
-            // On garde plus large si mode permissif
-            if ((is_vertical || permissif) && length > (permissif ? 15 : 50) && is_center) {
+            
+            // On garde plus large si mode is_souple
+            if ((is_vertical || is_souple) && length > (is_souple ? 15 : 50) && is_center) {
                 Point pt1(l[0], l[1] + roi_y);
                 Point pt2(l[2], l[3] + roi_y);
                 line(result, pt1, pt2, Scalar(0, 255, 0), 3, LINE_AA);
@@ -234,19 +429,205 @@ public:
                 if(is_center) nb_centrales++;
             }
         }
+        
         // Détection automatique de route droite : majorité de lignes verticales et centrales
         is_straight = (numLines > 1 && nb_verticales > 0.7 * numLines && nb_centrales > 0.7 * numLines);
+        
+        // Mise à jour des métriques
         metrics.numLinesDetected = numLines;
         metrics.averageLineLength = numLines > 0 ? totalLength / numLines : 0;
+        
         return numLines;
     }
-    
+
+    // Fonction de réduction de bruit avancée
+    Mat reduireBruitAvance(const Mat& inputGray) {
+        Mat result;
+        // 1. Filtre bilatéral - préserve les bords mieux que le flou gaussien
+        Mat bilateral;
+        bilateralFilter(inputGray, bilateral, 9, 75, 75);
+        
+        // 2. Filtre médian - efficace contre le bruit "sel et poivre"
+        Mat median;
+        medianBlur(bilateral, median, 5);
+        
+        // 3. Morphologie pour nettoyer davantage
+        Mat morpho;
+        Mat kernel = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
+        morphologyEx(median, morpho, MORPH_OPEN, kernel);
+        
+        // 4. Normalisation du contraste
+        normalize(morpho, result, 0, 255, NORM_MINMAX);
+        
+        return result;
+    }
+
+    // Fonction pour extraire la ROI (Region of Interest)
+    std::tuple<Mat, Mat, int, int> extractROI(const Mat& grayImage, const Mat& colorMask, bool extendedROI = false) {
+        // Calcul de la position de la ROI en fonction du mode
+        int roi_mode = extendedROI ? 1 : 0;
+        
+        //ici roi devient 2/3 bas de l'image . 
+        int roi_y = extendedROI ? grayImage.rows / 3 : grayImage.rows * ROI_FACTOR;
+        int roi_height = grayImage.rows - roi_y;
+        
+        // Création du rectangle ROI
+        Rect roi_rect(0, roi_y, grayImage.cols, roi_height);
+        
+       
+        Mat roi_gray = grayImage(roi_rect).clone();
+        Mat roi_mask = colorMask(roi_rect).clone();
+        
+        return std::make_tuple(roi_gray, roi_mask, roi_y, roi_mode);
+    }
+    // Fonction pour créer des masques de couleur pour détecter les lignes jaunes et blanches
+    Mat createRoadLineMasks(const Mat& input, bool detectYellow = true, bool detectWhite = true) {
+        Mat hsv;
+        cvtColor(input, hsv, COLOR_BGR2HSV);
+        
+        Mat final_mask = Mat::zeros(input.size(), CV_8UC1);
+        
+        // Déterminer si l'image est sombre
+        Scalar meanIntensity = mean(input);
+        bool isDarkImage = (meanIntensity[0] + meanIntensity[1] + meanIntensity[2])/3 < 100;
+        
+        // Masque pour les lignes jaunes avec adaptation selon luminosité
+        if (detectYellow) {
+            Scalar lower_yellow, upper_yellow;
+            if(isDarkImage) {
+                lower_yellow = Scalar(10, 40, 40);  // Plus permissif pour images sombres
+                upper_yellow = Scalar(45, 255, 255);
+            } else {
+                lower_yellow = Scalar(10, 80, 80);  // Plus strict pour images normales
+                upper_yellow = Scalar(40, 255, 255);
+            }
+            
+            Mat mask_yellow;
+            inRange(hsv, lower_yellow, upper_yellow, mask_yellow);
+            
+            // Application d'opérations morphologiques pour réduire le bruit
+            Mat kernel = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
+            morphologyEx(mask_yellow, mask_yellow, MORPH_OPEN, kernel);
+            
+            // Ajouter au masque final
+            bitwise_or(final_mask, mask_yellow, final_mask);
+        }
+        
+        // Masque pour les lignes blanches avec adaptation selon luminosité
+        if (detectWhite) {
+            Scalar lower_white, upper_white;
+            if(isDarkImage) {
+                lower_white = Scalar(0, 0, 140);     // Plus permissif pour images sombres
+                upper_white = Scalar(180, 45, 255);
+            } else {
+                lower_white = Scalar(0, 0, 200);     // Plus strict pour images normales
+                upper_white = Scalar(180, 30, 255);
+            }
+            
+            Mat mask_white;
+            inRange(hsv, lower_white, upper_white, mask_white);
+            
+            // Application d'opérations morphologiques pour réduire le bruit
+            Mat kernel = getStructuringElement(MORPH_RECT, Size(3, 3));
+            morphologyEx(mask_white, mask_white, MORPH_OPEN, kernel);
+            
+            // Ajouter au masque final
+            bitwise_or(final_mask, mask_white, final_mask);
+        }
+        
+        // Opération finale de fermeture pour éliminer les petits trous
+        Mat kernel = getStructuringElement(MORPH_RECT, Size(5, 5));
+        morphologyEx(final_mask, final_mask, MORPH_CLOSE, kernel);
+        
+        return final_mask;
+    }
+            
+    Mat pretraitementImage(const string& imagePath) {
+        auto startTotal = high_resolution_clock::now();
+        
+        // Lecture de l'image
+        auto startImage = high_resolution_clock::now();
+        Mat input = imread(imagePath);
+        if(input.empty()) {
+            throw runtime_error("Impossible de charger l'image: " + imagePath);
+        }
+        auto endImage = high_resolution_clock::now();
+        metrics.readImageTime = duration_cast<milliseconds>(endImage - startImage).count();
+        
+        // Augmentation du contraste
+        input = augmenterConstraste(input);
+        
+        // Création du masque couleur AVANT le flou gaussien
+        // Cela permet d'utiliser l'image originale pour la détection de couleur
+        auto startColor = high_resolution_clock::now();
+        Mat colorMask = createRoadLineMasks(input);
+        auto endColor = high_resolution_clock::now();
+        metrics.color = duration_cast<milliseconds>(endColor - startColor).count();
+        
+        // Conversion en niveaux de gris
+        Mat gray;
+        cvtColor(input, gray, COLOR_BGR2GRAY);
+        
+        // Application du flou gaussien APRÈS la création du masque couleur
+        auto startGaussienne = high_resolution_clock::now();
+        gray = reduireBruitAvance(gray);
+        auto endGaussienne = high_resolution_clock::now();
+        metrics.gaussianTime = duration_cast<milliseconds>(endGaussienne - startGaussienne).count();
+        
+        // Extraction de la ROI avec l'image floutée
+        auto [roi_gray, roi_mask, roi_y, roi_mode] = extractROI(gray, colorMask);
+        // Application du filtre de Sobel sur la ROI
+        auto startSobel = high_resolution_clock::now();
+        Mat edges = cannyMultiThread(roi_gray, 25);
+        bitwise_and(edges, roi_mask, edges); // Appliquer le masque de couleur
+        auto endSobel = high_resolution_clock::now();
+        metrics.sobelTime = duration_cast<milliseconds>(endSobel - startSobel).count();
+        
+        // Application de la transformée de Hough
+        auto startHough = high_resolution_clock::now();
+        Mat result = input.clone();
+        bool is_straight = false;
+        //direct permissif
+        int numLines = houghMultiThreadAdaptative(edges, result, roi_y, roi_mode, is_straight , true);
+        
+        //Si peu de lignes détectées, on essaie avec une ROI étendue et des paramètres plus is_souples
+        auto startModeSouple = high_resolution_clock::now();
+
+        //on regarde ici si on a obtenu qlq chose de correct ? sinon on essaye d'assouplir les contraintes
+        // if(numLines < nombreMinimalLignes) {
+        //     cout << "entrée dans le mode plus souple " << endl ; 
+        //     auto [extended_roi_gray, extended_roi_mask, extended_roi_y, extended_roi_mode] = extractROI(gray, colorMask, true);
+        //     // Traitement avec paramètres plus is_souples
+        //     edges = cannyMultiThread(extended_roi_gray, 18);
+        //     bitwise_and(edges, extended_roi_mask, edges);
+        //     result = input.clone();
+        //     is_straight = false;
+        //     numLines = houghMultiThreadAdaptative(edges, result, extended_roi_y, extended_roi_mode, is_straight, true);
+        // }
+        auto endModeSouple = high_resolution_clock::now();
+        metrics.modeSoupleTime = duration_cast<milliseconds>(endModeSouple - startModeSouple).count();
+        auto endHough = high_resolution_clock::now();
+
+        //Remarque ici le modeSouple peut ou ne pas être pris en compte dans le temps de Hough 
+        //TODO éventuellement meilleure 
+        metrics.houghTime = duration_cast<milliseconds>(endHough - startHough).count();
+        
+        // Calcul des métriques finales
+        auto endTotal = high_resolution_clock::now();
+        metrics.totalTime = duration_cast<milliseconds>(endTotal - startTotal).count();
+        metrics.processingFPS = 1000.0 / metrics.totalTime;
+        
+        return result;
+    }
+
     void printMetrics() {
         cout << "\n=== Métriques de Performance ===" << endl;
         cout << "Temps de lecture de l'image: " << metrics.readImageTime << " ms" << endl;
         cout << "Temps de traitement Gaussienne : " << metrics.gaussianTime << " ms" << endl;
+        cout << "Temps de traitement couleur: " << metrics.color << " ms" << endl;
         cout << "Temps de traitement Sobel: " << fixed << setprecision(2) << metrics.sobelTime << " ms" << endl;
         cout << "Temps de traitement Hough: " << metrics.houghTime << " ms" << endl;
+        cout << "Temps passé dans mode souple ?? : " << metrics.modeSoupleTime << " ms" << endl;
         cout << "Temps total de traitement: " << metrics.totalTime << " ms" << endl;
         cout << "FPS: " << metrics.processingFPS << endl;
         cout << "Nombre de lignes détectées: " << metrics.numLinesDetected << endl;
@@ -257,27 +638,35 @@ public:
 
 int main() {
     try {
-        RoadDetector detector;
+        DetecteurLignes detector;
         
-        // Traitement de la première image
-        cout << "Traitement de route_low.jpg..." << endl;
-        Mat result1 = detector.processImage("route_low.jpg");
-        detector.printMetrics();
-        imwrite("result_route_low.jpg", result1);
+    
+        std::cout << "=== Début récupération données " << endl;
+        auto imageFiles = getImagesFromDirectory(input_dir);
+        std::cout << "Found " << imageFiles.size() << " images to process" << std::endl;
+    
+        int processedCount = 0;
+        for (const auto& imagePath : imageFiles) {
+            std::string filename = imagePath.filename().string();
+            std::cout << "\nProcessing " << filename << " (" << (++processedCount) << "/" 
+                        << imageFiles.size() << ")..." << std::endl;
+
+            detector.resetMetrics();
+            Mat result = detector.pretraitementImage(imagePath.string());
+            detector.printMetrics();
+            
+            fs::path outputPath = fs::path(output_dir) / fs::path("result_" + filename);
+            std::cout << "Saving result to: " << outputPath.string() << std::endl;
+            
+            imwrite(outputPath.string(), result);
+        }
         
-        // Réinitialisation des métriques
-        detector.resetMetrics();
+        std::cout << "\nSuccessfully processed " << processedCount << " image(s)" << std::endl;
         
-        // Traitement de la deuxième image
-        cout << "Traitement de route_virage.jpg..." << endl;
-        Mat result2 = detector.processImage("route_virage.jpg");
-        detector.printMetrics();
-        imwrite("result_route_virage.jpg", result2);
-        
-    } catch(const exception& e) {
-        cerr << "Erreur: " << e.what() << endl;
+    } catch(const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
         return 1;
     }
     
     return 0;
-} 
+}
