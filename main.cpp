@@ -589,22 +589,7 @@ public:
         bool is_straight = false;
         //direct permissif
         int numLines = houghMultiThreadAdaptative(edges, result, roi_y, roi_mode, is_straight , true);
-        
-        //Si peu de lignes détectées, on essaie avec une ROI étendue et des paramètres plus is_souples
-        auto startModeSouple = high_resolution_clock::now();
-
-        //on regarde ici si on a obtenu qlq chose de correct ? sinon on essaye d'assouplir les contraintes
-        // if(numLines < nombreMinimalLignes) {
-        //     cout << "entrée dans le mode plus souple " << endl ; 
-        //     auto [extended_roi_gray, extended_roi_mask, extended_roi_y, extended_roi_mode] = extractROI(gray, colorMask, true);
-        //     // Traitement avec paramètres plus is_souples
-        //     edges = cannyMultiThread(extended_roi_gray, 18);
-        //     bitwise_and(edges, extended_roi_mask, edges);
-        //     result = input.clone();
-        //     is_straight = false;
-        //     numLines = houghMultiThreadAdaptative(edges, result, extended_roi_y, extended_roi_mode, is_straight, true);
-        // }
-        auto endModeSouple = high_resolution_clock::now();
+    
         metrics.modeSoupleTime = duration_cast<milliseconds>(endModeSouple - startModeSouple).count();
         auto endHough = high_resolution_clock::now();
 
