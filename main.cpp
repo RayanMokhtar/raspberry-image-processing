@@ -60,6 +60,16 @@ struct HoughThreadParams {
     mutex* linesMutex;
 };
 
+struct ColorThreadParams {
+    const Mat* input;
+    Mat* output;
+    int startRow;
+    int endRow;
+    bool isDarkImage;
+    bool detectYellow;
+    bool detectWhite;
+};
+
 
 //fonctions utilitaires pour la lecture des images dans notre dataset 
 namespace fs = std::filesystem;
@@ -116,6 +126,68 @@ bool ensureDirectoryExists(const std::string& dirPath) {
 }
 
 
+
+void colorMaskThreadFunction(ColorThreadParams params) {
+    // Create ROI for this thread
+    Rect roi(0, params.startRow, params.input->cols, params.endRow - params.startRow);
+    Mat inputROI = (*params.input)(roi);
+    Mat outputROI = Mat::zeros(inputROI.size(), CV_8UC1);
+    
+    // Convert to HSV
+    Mat hsv;
+    cvtColor(inputROI, hsv, COLOR_BGR2HSV);
+    
+    // Yellow mask with adaptive thresholds
+    if (params.detectYellow) {
+        Scalar lower_yellow, upper_yellow;
+        if(params.isDarkImage) {
+            lower_yellow = Scalar(10, 40, 40);
+            upper_yellow = Scalar(45, 255, 255);
+        } else {
+            lower_yellow = Scalar(10, 80, 80);
+            upper_yellow = Scalar(40, 255, 255);
+        }
+        
+        Mat mask_yellow;
+        inRange(hsv, lower_yellow, upper_yellow, mask_yellow);
+        
+        // Apply morphological operations
+        Mat kernel = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
+        morphologyEx(mask_yellow, mask_yellow, MORPH_OPEN, kernel);
+        
+        // Add to final mask
+        bitwise_or(outputROI, mask_yellow, outputROI);
+    }
+    
+    // White mask with adaptive thresholds
+    if (params.detectWhite) {
+        Scalar lower_white, upper_white;
+        if(params.isDarkImage) {
+            lower_white = Scalar(0, 0, 140);
+            upper_white = Scalar(180, 45, 255);
+        } else {
+            lower_white = Scalar(0, 0, 200);
+            upper_white = Scalar(180, 30, 255);
+        }
+        
+        Mat mask_white;
+        inRange(hsv, lower_white, upper_white, mask_white);
+        
+        // Apply morphological operations
+        Mat kernel = getStructuringElement(MORPH_RECT, Size(3, 3));
+        morphologyEx(mask_white, mask_white, MORPH_OPEN, kernel);
+        
+        // Add to final mask
+        bitwise_or(outputROI, mask_white, outputROI);
+    }
+    
+    // Final morphological closing
+    Mat kernel = getStructuringElement(MORPH_RECT, Size(5, 5));
+    morphologyEx(outputROI, outputROI, MORPH_CLOSE, kernel);
+    
+    // Copy result to output
+    outputROI.copyTo((*params.output)(roi));
+}
 
 
 //TODO à déplacer par la suite 
@@ -481,65 +553,128 @@ public:
         return std::make_tuple(roi_gray, roi_mask, roi_y, roi_mode);
     }
     // Fonction pour créer des masques de couleur pour détecter les lignes jaunes et blanches
-    Mat createRoadLineMasks(const Mat& input, bool detectYellow = true, bool detectWhite = true) {
-        Mat hsv;
-        cvtColor(input, hsv, COLOR_BGR2HSV);
-        
+    Mat createRoadLineMasksMultiThread(const Mat& input, bool detectYellow = true, bool detectWhite = true) {
+        // Create output mask
         Mat final_mask = Mat::zeros(input.size(), CV_8UC1);
         
-        // Déterminer si l'image est sombre
+        // Determine if the image is dark
         Scalar meanIntensity = mean(input);
         bool isDarkImage = (meanIntensity[0] + meanIntensity[1] + meanIntensity[2])/3 < 100;
         
-        // Masque pour les lignes jaunes avec adaptation selon luminosité
-        if (detectYellow) {
-            Scalar lower_yellow, upper_yellow;
-            if(isDarkImage) {
-                lower_yellow = Scalar(10, 40, 40);  // Plus permissif pour images sombres
-                upper_yellow = Scalar(45, 255, 255);
-            } else {
-                lower_yellow = Scalar(10, 80, 80);  // Plus strict pour images normales
-                upper_yellow = Scalar(40, 255, 255);
-            }
+        // Calculate rows per thread
+        int rowsPerThread = input.rows / NUM_THREADS;
+        rowsPerThread = max(rowsPerThread, 10); // Minimum rows per thread
+        
+        // Overlap for morphological operations
+        int overlap = 5; // Based on kernel size
+        
+        vector<thread> threads;
+        for(int i = 0; i < NUM_THREADS; i++) {
+            int startRow = i * rowsPerThread;
+            int endRow = (i == NUM_THREADS-1) ? input.rows : (i+1) * rowsPerThread;
             
-            Mat mask_yellow;
-            inRange(hsv, lower_yellow, upper_yellow, mask_yellow);
+            // Add overlap between regions
+            startRow = max(0, startRow - (i > 0 ? overlap : 0));
+            endRow = min(input.rows, endRow + (i < NUM_THREADS-1 ? overlap : 0));
             
-            // Application d'opérations morphologiques pour réduire le bruit
-            Mat kernel = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
-            morphologyEx(mask_yellow, mask_yellow, MORPH_OPEN, kernel);
+            // Create thread parameters
+            ColorThreadParams params;
+            params.input = &input;
+            params.output = &final_mask;
+            params.startRow = startRow;
+            params.endRow = endRow;
+            params.isDarkImage = isDarkImage;
+            params.detectYellow = detectYellow;
+            params.detectWhite = detectWhite;
             
-            // Ajouter au masque final
-            bitwise_or(final_mask, mask_yellow, final_mask);
+            // Launch thread
+            threads.emplace_back(colorMaskThreadFunction, params);
         }
         
-        // Masque pour les lignes blanches avec adaptation selon luminosité
-        if (detectWhite) {
-            Scalar lower_white, upper_white;
-            if(isDarkImage) {
-                lower_white = Scalar(0, 0, 140);     // Plus permissif pour images sombres
-                upper_white = Scalar(180, 45, 255);
-            } else {
-                lower_white = Scalar(0, 0, 200);     // Plus strict pour images normales
-                upper_white = Scalar(180, 30, 255);
-            }
-            
-            Mat mask_white;
-            inRange(hsv, lower_white, upper_white, mask_white);
-            
-            // Application d'opérations morphologiques pour réduire le bruit
-            Mat kernel = getStructuringElement(MORPH_RECT, Size(3, 3));
-            morphologyEx(mask_white, mask_white, MORPH_OPEN, kernel);
-            
-            // Ajouter au masque final
-            bitwise_or(final_mask, mask_white, final_mask);
+        // Wait for all threads to finish
+        for(auto& t : threads) {
+            t.join();
         }
         
-        // Opération finale de fermeture pour éliminer les petits trous
+        // Final cleanup to ensure consistent results across thread boundaries
         Mat kernel = getStructuringElement(MORPH_RECT, Size(5, 5));
         morphologyEx(final_mask, final_mask, MORPH_CLOSE, kernel);
         
         return final_mask;
+    }
+
+    Mat gaussianBlurMultiThread(const Mat& input, Size kernelSize = Size(5, 5), double sigmaX = 1.5, double sigmaY = 0) {
+        // Vérification de l'entrée
+        if (input.empty()) {
+            std::cerr << "gaussianBlurMultiThread: Image d'entrée vide" << std::endl;
+            return Mat();
+        }
+        
+        // Création de la matrice de sortie
+        Mat output = Mat::zeros(input.size(), input.type());
+        
+        // Calcul du nombre de lignes par thread
+        int rowsPerThread = input.rows / NUM_THREADS;
+        rowsPerThread = max(rowsPerThread, 10); // Minimum pour éviter overhead des threads
+        
+        // Déterminer le chevauchement nécessaire (basé sur la taille du noyau)
+        int overlap = max(kernelSize.height / 2, 2);
+        
+        vector<thread> threads;
+        for(int i = 0; i < NUM_THREADS; i++) {
+            int startRow = i * rowsPerThread;
+            int endRow = (i == NUM_THREADS-1) ? input.rows : (i+1) * rowsPerThread;
+            
+            // Ajouter un chevauchement entre les régions pour éviter les artefacts
+            startRow = max(0, startRow - (i > 0 ? overlap : 0));
+            endRow = min(input.rows, endRow + (i < NUM_THREADS-1 ? overlap : 0));
+            
+            // Lancer le thread avec lambda
+            threads.emplace_back([&input, &output, startRow, endRow, kernelSize, sigmaX, sigmaY, overlap]() {
+                try {
+                    // Créer une ROI pour la section à traiter
+                    Rect roi(0, startRow, input.cols, endRow - startRow);
+                    
+                    // Vérifier que la ROI est dans les limites
+                    if (roi.x < 0 || roi.y < 0 || roi.x + roi.width > input.cols || roi.y + roi.height > input.rows) {
+                        std::cerr << "gaussianBlurMultiThread: ROI invalide: " << roi << std::endl;
+                        return;
+                    }
+                    
+                    // Extraire la ROI et appliquer le flou gaussien
+                    Mat inputROI = input(roi);
+                    Mat blurredROI;
+                    GaussianBlur(inputROI, blurredROI, kernelSize, sigmaX, sigmaY);
+                    
+                    // Déterminer quelle partie copier (exclure les zones de chevauchement)
+                    int copyStartY = (startRow > 0) ? overlap : 0;
+                    int copyHeight = (endRow < input.rows) ? (endRow - startRow - overlap) : (endRow - startRow);
+                    
+                    if (copyHeight <= 0) {
+                        return;
+                    }
+                    
+                    // Copier le résultat dans la matrice de sortie
+                    Rect targetRoi(0, startRow + copyStartY, input.cols, copyHeight);
+                    Rect sourceRoi(0, copyStartY, input.cols, copyHeight);
+                    
+                    // Vérifier les dimensions avant de copier
+                    if (targetRoi.y + targetRoi.height <= output.rows && 
+                        sourceRoi.y + sourceRoi.height <= blurredROI.rows) {
+                        blurredROI(sourceRoi).copyTo(output(targetRoi));
+                    }
+                } catch (const cv::Exception& e) {
+                    std::cerr << "OpenCV exception dans thread GaussianBlur: " << e.what() << std::endl;
+                }
+            });
+        }
+        
+        // Attendre la fin de tous les threads
+        for(auto& t : threads) {
+            t.join();
+        }
+        
+        return output;
     }
             
     Mat pretraitementImage(const string& imagePath) {
@@ -551,16 +686,15 @@ public:
         if(input.empty()) {
             throw runtime_error("Impossible de charger l'image: " + imagePath);
         }
+        input = augmenterConstraste(input);
         auto endImage = high_resolution_clock::now();
         metrics.readImageTime = duration_cast<milliseconds>(endImage - startImage).count();
         
-        // Augmentation du contraste
-        input = augmenterConstraste(input);
+
         
         // Création du masque couleur AVANT le flou gaussien
-        // Cela permet d'utiliser l'image originale pour la détection de couleur
         auto startColor = high_resolution_clock::now();
-        Mat colorMask = createRoadLineMasks(input);
+        Mat colorMask = createRoadLineMasksMultiThread(input);
         auto endColor = high_resolution_clock::now();
         metrics.color = duration_cast<milliseconds>(endColor - startColor).count();
         
@@ -570,7 +704,9 @@ public:
         
         // Application du flou gaussien APRÈS la création du masque couleur
         auto startGaussienne = high_resolution_clock::now();
-        gray = reduireBruitAvance(gray);
+        GaussianBlur(gray, gray, Size(5, 5), 1.5); // multithreading pas nécessaire ici
+        //gray = gaussianBlurMultiThread(gray, Size(5, 5), 1.5); // multithreading pas nécessaire ici
+        // Mat gray = reduireBruitAvance(input); // manque optimisation par rapport au bluring gaussian . 
         auto endGaussienne = high_resolution_clock::now();
         metrics.gaussianTime = duration_cast<milliseconds>(endGaussienne - startGaussienne).count();
         
@@ -585,12 +721,10 @@ public:
         
         // Application de la transformée de Hough
         auto startHough = high_resolution_clock::now();
-        Mat result = input.clone();
+        Mat result = input.clone();//chargement de la matrice à ce niveau ??? TODO a voir si optimal ? 
         bool is_straight = false;
         //direct permissif
-        int numLines = houghMultiThreadAdaptative(edges, result, roi_y, roi_mode, is_straight , true);
-    
-        metrics.modeSoupleTime = duration_cast<milliseconds>(endModeSouple - startModeSouple).count();
+        int numLines = houghMultiThreadAdaptative(edges, result, roi_y, roi_mode, is_straight , true); 
         auto endHough = high_resolution_clock::now();
 
         //Remarque ici le modeSouple peut ou ne pas être pris en compte dans le temps de Hough 
@@ -606,6 +740,7 @@ public:
     }
 
     void printMetrics() {
+        // affichage des métriques . 
         cout << "\n=== Métriques de Performance ===" << endl;
         cout << "Temps de lecture de l'image: " << metrics.readImageTime << " ms" << endl;
         cout << "Temps de traitement Gaussienne : " << metrics.gaussianTime << " ms" << endl;
