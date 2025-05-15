@@ -24,7 +24,7 @@ CFLAGS = $(COMPILERFLAGS)
 
 
 main : main.cpp
-	g++ -o main main.cpp `pkg-config --cflags --libs opencv4` -g -Wall
+	g++ -std=c++17 -O3 -Wall -g main.cpp -o main `pkg-config --cflags --libs opencv4` -pthread
 
 run : main
 	./main
