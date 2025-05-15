@@ -16,7 +16,7 @@ using namespace chrono;
 
 
 
-//décalratation des csts 
+//décalratation des csts
 const int NUM_THREADS = 4; // demain tester avec 3 4 5 threads
 const double ROI_FACTOR = 0.5; //  commence par 50% plus hauts
 const int THETA_STEP = 4;
