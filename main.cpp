@@ -14,7 +14,9 @@ using namespace cv;
 using namespace std;
 using namespace chrono;
 
-// Constantes
+
+
+//décalratation des csts 
 const int NUM_THREADS = 4; // demain tester avec 3 4 5 threads
 const double ROI_FACTOR = 0.5; //  commence par 50% plus hauts
 const int THETA_STEP = 4;
@@ -71,9 +73,10 @@ struct ColorThreadParams {
 };
 
 
-//fonctions utilitaires pour la lecture des images dans notre dataset 
+//fonctions utilitaires pour la lecture des images dans notre dataset // penser compilation avec c++17 
 namespace fs = std::filesystem;
 
+//peut servir par pour la suite pour vérifier si l'image est bien une image
 bool isImageFile(const fs::path& path) {
     if (!fs::is_regular_file(path)) return false;
     
@@ -88,7 +91,7 @@ bool isImageFile(const fs::path& path) {
     return std::find(validExtensions.begin(), validExtensions.end(), ext) != validExtensions.end();
 }
 
-// Function to get all image files from a directory
+//helper function qui récup tt images de dossier
 std::vector<fs::path> getImagesFromDirectory(const std::string& dirPath) {
     std::vector<fs::path> imageFiles;
     
@@ -126,18 +129,17 @@ bool ensureDirectoryExists(const std::string& dirPath) {
 }
 
 
-
+//todo , optimiser cette fonctions pour éviter de faire des copies inutiles 
 void colorMaskThreadFunction(ColorThreadParams params) {
-    // Create ROI for this thread
     Rect roi(0, params.startRow, params.input->cols, params.endRow - params.startRow);
     Mat inputROI = (*params.input)(roi);
     Mat outputROI = Mat::zeros(inputROI.size(), CV_8UC1);
     
-    // Convert to HSV
+    // Conversion en  HSV
     Mat hsv;
     cvtColor(inputROI, hsv, COLOR_BGR2HSV);
     
-    // Yellow mask with adaptive thresholds
+    
     if (params.detectYellow) {
         Scalar lower_yellow, upper_yellow;
         if(params.isDarkImage) {
@@ -151,15 +153,14 @@ void colorMaskThreadFunction(ColorThreadParams params) {
         Mat mask_yellow;
         inRange(hsv, lower_yellow, upper_yellow, mask_yellow);
         
-        // Apply morphological operations
+        
         Mat kernel = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
         morphologyEx(mask_yellow, mask_yellow, MORPH_OPEN, kernel);
         
-        // Add to final mask
+        //lignes jaunes et blanche ( ou ) 
         bitwise_or(outputROI, mask_yellow, outputROI);
     }
     
-    // White mask with adaptive thresholds
     if (params.detectWhite) {
         Scalar lower_white, upper_white;
         if(params.isDarkImage) {
@@ -185,7 +186,6 @@ void colorMaskThreadFunction(ColorThreadParams params) {
     Mat kernel = getStructuringElement(MORPH_RECT, Size(5, 5));
     morphologyEx(outputROI, outputROI, MORPH_CLOSE, kernel);
     
-    // Copy result to output
     outputROI.copyTo((*params.output)(roi));
 }
 
@@ -327,7 +327,6 @@ public:
     }
     
     Mat sobelMultiThread(Mat& input, int threshold = 50) {
-        // Création de la matrice de sortie
         Mat output = Mat::zeros(input.size(), CV_8UC1);
         int rowsPerThread = input.rows / NUM_THREADS;
         
@@ -393,7 +392,7 @@ public:
         int rowsPerThread = edges.rows / NUM_THREADS;
         int overlap = minLineLength; // Chevauchement équivalent à la longueur minimale de ligne
         
-        // Lancer les threads
+        // Lancer les threads à ce niveau 
         vector<thread> threads;
         for(int i = 0; i < NUM_THREADS; i++) {
             int startRow = max(0, i * rowsPerThread - overlap);
@@ -512,7 +511,7 @@ public:
         return numLines;
     }
 
-    // Fonction de réduction de bruit avancée
+    // Fonction de réduction de bruit avancée , remplacée par gaussienne au final pour rapport qualité/temps
     Mat reduireBruitAvance(const Mat& inputGray) {
         Mat result;
         // 1. Filtre bilatéral - préserve les bords mieux que le flou gaussien
@@ -610,7 +609,6 @@ public:
             return Mat();
         }
         
-        // Création de la matrice de sortie
         Mat output = Mat::zeros(input.size(), input.type());
         
         // Calcul du nombre de lignes par thread
@@ -629,19 +627,15 @@ public:
             startRow = max(0, startRow - (i > 0 ? overlap : 0));
             endRow = min(input.rows, endRow + (i < NUM_THREADS-1 ? overlap : 0));
             
-            // Lancer le thread avec lambda
             threads.emplace_back([&input, &output, startRow, endRow, kernelSize, sigmaX, sigmaY, overlap]() {
                 try {
-                    // Créer une ROI pour la section à traiter
                     Rect roi(0, startRow, input.cols, endRow - startRow);
                     
-                    // Vérifier que la ROI est dans les limites
                     if (roi.x < 0 || roi.y < 0 || roi.x + roi.width > input.cols || roi.y + roi.height > input.rows) {
                         std::cerr << "gaussianBlurMultiThread: ROI invalide: " << roi << std::endl;
                         return;
                     }
                     
-                    // Extraire la ROI et appliquer le flou gaussien
                     Mat inputROI = input(roi);
                     Mat blurredROI;
                     GaussianBlur(inputROI, blurredROI, kernelSize, sigmaX, sigmaY);
@@ -776,12 +770,12 @@ int main() {
             detector.printMetrics();
             
             fs::path outputPath = fs::path(output_dir) / fs::path("result_" + filename);
-            std::cout << "Saving result to: " << outputPath.string() << std::endl;
+            std::cout << "résultat sauvegardé chemin ... : " << outputPath.string() << std::endl;
             
             imwrite(outputPath.string(), result);
         }
         
-        std::cout << "\nSuccessfully processed " << processedCount << " image(s)" << std::endl;
+        std::cout << "\nprocessed " << processedCount << " image(s)" << std::endl;
         
     } catch(const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
